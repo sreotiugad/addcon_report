@@ -305,13 +305,16 @@ def naver_list_adgroups(acc, campaign_id: str = None):
     # ✅ 라이브 상태만 필터
     return [g for g in j if str(g.get("status", "")).upper() in ("ELIGIBLE", "ELIGIBLE_STATUS")]
 
-def naver_fetch_stats_batch(acc, grp_ids: list, since_yyyymmdd, until_yyyymmdd) -> dict:
+def naver_fetch_stats_batch(acc, grp_ids: list, since_yyyymmdd, until_yyyymmdd, logs=None) -> dict:
     """
     여러 광고그룹 ID를 한 번에 조회 (ids 파라미터 사용)
     반환: {grp_id: [item, ...]}
+    실패 시 개별 호출로 폴백
     """
+    if logs is None:
+        logs = []
+
     uri = "/stats"
-    # 네이버 API ids 파라미터는 최대 100개
     BATCH_SIZE = 100
     result = {}
 
@@ -331,15 +334,49 @@ def naver_fetch_stats_batch(acc, grp_ids: list, since_yyyymmdd, until_yyyymmdd) 
             timeout=60,
         )
         if r.status_code != 200:
+            logs.append(f"⚠️ 배치 실패 status={r.status_code}, 개별 호출로 폴백")
+            # 개별 호출 폴백
+            for grp_id in batch:
+                r2 = requests.get(
+                    NAVER_BASE_URL + uri,
+                    headers=naver_headers(acc, uri, "GET"),
+                    params={
+                        "id": grp_id,
+                        "fields": json.dumps(["impCnt","clkCnt","salesAmt","ccnt"]),
+                        "timeRange": json.dumps({"since": since_yyyymmdd, "until": until_yyyymmdd}),
+                        "timeIncrement": "1",
+                        "breakdown": "pcMblTp",
+                    },
+                    timeout=60,
+                )
+                if r2.status_code == 200:
+                    sj2 = safe_json(r2) or {}
+                    result[grp_id] = sj2.get("data", [])
             continue
+
         sj = safe_json(r) or {}
-        # ids 응답은 {id: {data: [...]}} 형태
-        for grp_id in batch:
-            grp_data = sj.get(grp_id, {})
-            if isinstance(grp_data, dict):
-                result[grp_id] = grp_data.get("data", [])
-            elif isinstance(grp_data, list):
-                result[grp_id] = grp_data
+        # 응답 형식 디버그 (첫 배치만)
+        if i == 0:
+            keys = list(sj.keys())[:5] if isinstance(sj, dict) else "list"
+            logs.append(f"[배치 응답] type={type(sj).__name__} keys샘플={keys}")
+
+        if isinstance(sj, dict):
+            for grp_id in batch:
+                grp_data = sj.get(grp_id)
+                if grp_data is None:
+                    continue
+                if isinstance(grp_data, dict):
+                    result[grp_id] = grp_data.get("data", [])
+                elif isinstance(grp_data, list):
+                    result[grp_id] = grp_data
+        elif isinstance(sj, list):
+            # 리스트 형태면 id 필드로 그룹핑
+            for item in sj:
+                gid = item.get("id") or item.get("nccAdgroupId")
+                if gid:
+                    if gid not in result:
+                        result[gid] = []
+                    result[gid].append(item)
 
     return result
 
@@ -525,7 +562,7 @@ def get_n_data(d_from, d_to, logs=None):
             continue
 
         # ✅ 배치로 한 번에 조회
-        batch_result = naver_fetch_stats_batch(acc, all_grp_ids, since, until)
+        batch_result = naver_fetch_stats_batch(acc, all_grp_ids, since, until, logs)
         logs.append(f"[NAVER] 배치 응답 그룹 수: {len(batch_result)}")
 
         # 그룹ID → 캠페인 매핑
@@ -795,23 +832,34 @@ def get_g_data(d_from, d_to, logs=None):
     client = _google_client()
     ga = client.get_service("GoogleAdsService")
 
-    # ✅ WHERE절 필터 제거 → SELECT로 가져온 후 파이썬에서 SIGN_UP 필터
-    query = f"""
+    # ✅ 쿼리1: 노출/클릭/비용 (conversion_action_category 없이)
+    query_cost = f"""
         SELECT
           segments.date,
-          segments.conversion_action_category,
           campaign.advertising_channel_type,
           campaign.name,
           segments.device,
           metrics.impressions,
           metrics.clicks,
-          metrics.cost_micros,
+          metrics.cost_micros
+        FROM campaign
+        WHERE segments.date BETWEEN '{d_from}' AND '{d_to}'
+    """.strip()
+
+    # ✅ 쿼리2: 가입 전환만 (impressions/clicks/cost 없이)
+    query_conv = f"""
+        SELECT
+          segments.date,
+          campaign.name,
+          segments.device,
+          segments.conversion_action_category,
           metrics.conversions
         FROM campaign
         WHERE segments.date BETWEEN '{d_from}' AND '{d_to}'
     """.strip()
 
-    rows = []
+    rows_cost = []
+    rows_conv = []
     d_map   = {"DESKTOP": "PC", "MOBILE": "모바일", "TABLET": "모바일"}
     div_map = {"SEARCH": "SA", "DISPLAY": "DA", "VIDEO": "VA", "PERFORMANCE_MAX": "DA"}
     type_ko = {"SEARCH": "검색", "DISPLAY": "디스플레이", "VIDEO": "동영상", "PERFORMANCE_MAX": "실적 최대화"}
@@ -819,15 +867,13 @@ def get_g_data(d_from, d_to, logs=None):
     for cust_id, service in GOOGLE_CUSTOMER_IDS.items():
         try:
             logs.append(f"[Google] customer_id={cust_id} service={service}")
-            stream = ga.search_stream(customer_id=cust_id, query=query)
-            count = 0
+
+            # 비용/클릭/노출 수집
+            stream = ga.search_stream(customer_id=cust_id, query=query_cost)
             for b in stream:
                 for r in b.results:
-                    # ✅ SIGN_UP(가입) 전환만 파이썬에서 필터
-                    if r.segments.conversion_action_category.name != "SIGN_UP":
-                        continue
                     ch = r.campaign.advertising_channel_type.name
-                    rows.append({
+                    rows_cost.append({
                         "매체구분": div_map.get(ch, "SA"),
                         "매체": "구글",
                         "캠페인유형": type_ko.get(ch, ch),
@@ -838,15 +884,42 @@ def get_g_data(d_from, d_to, logs=None):
                         "노출수": int(r.metrics.impressions),
                         "클릭수": int(r.metrics.clicks),
                         "총비용": float(r.metrics.cost_micros) / 1_000_000,
-                        "가입": float(r.metrics.conversions),
                         "서비스": service,
                     })
-                    count += 1
-            logs.append(f"✅ [Google] customer_id={cust_id} rows={count}")
+
+            # 가입 전환만 수집
+            stream2 = ga.search_stream(customer_id=cust_id, query=query_conv)
+            for b in stream2:
+                for r in b.results:
+                    # ✅ SIGN_UP만 필터
+                    if r.segments.conversion_action_category.name != "SIGN_UP":
+                        continue
+                    rows_conv.append({
+                        "캠페인": r.campaign.name,
+                        "날짜": str(r.segments.date),
+                        "기기": d_map.get(r.segments.device.name, "모바일"),
+                        "가입": float(r.metrics.conversions),
+                    })
+
+            logs.append(f"✅ [Google] customer_id={cust_id} cost_rows={len(rows_cost)} conv_rows={len(rows_conv)}")
         except Exception as e:
             logs.append(f"❌ [Google] customer_id={cust_id} 오류: {e}")
 
-    return pd.DataFrame(rows), logs
+    if not rows_cost:
+        return pd.DataFrame(), logs
+
+    df_cost = pd.DataFrame(rows_cost)
+    df_conv = pd.DataFrame(rows_conv) if rows_conv else pd.DataFrame(columns=["캠페인","날짜","기기","가입"])
+
+    # 가입 머지
+    if not df_conv.empty:
+        df_conv_agg = df_conv.groupby(["캠페인","날짜","기기"], as_index=False)["가입"].sum()
+        df_cost = df_cost.merge(df_conv_agg, on=["캠페인","날짜","기기"], how="left")
+        df_cost["가입"] = df_cost["가입"].fillna(0)
+    else:
+        df_cost["가입"] = 0.0
+
+    return df_cost, logs
 
 def get_g_keyword_data(d_from, d_to):
     client = _google_client()
