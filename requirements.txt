@@ -1,0 +1,7 @@
+streamlit
+google-genai
+google-ads
+pandas
+numpy
+openpyxl
+requests
