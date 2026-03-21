@@ -853,7 +853,7 @@ def get_g_data(d_from, d_to, logs=None):
                 for r in b.results:
                     cat_name = r.segments.conversion_action_category.name
                     cat_names_seen.add(cat_name)
-                    if cat_name != "SIGN_UP":
+                    if cat_name != "SIGNUP":
                         continue
                     rows_conv.append({
                         "캠페인": r.campaign.name,
