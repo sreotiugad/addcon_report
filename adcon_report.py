@@ -872,6 +872,12 @@ def get_g_data(d_from, d_to, logs=None):
 
     df_cost = pd.DataFrame(rows_cost)
 
+    # ✅ cost 중복 제거 - 캠페인+그룹+날짜+기기 기준으로 집계
+    df_cost = df_cost.groupby(
+        ["매체구분","매체","캠페인유형","캠페인","그룹","날짜","기기","서비스"],
+        as_index=False
+    ).agg({"노출수":"sum","클릭수":"sum","총비용":"sum"})
+
     # 가입 머지 - 캠페인+그룹+날짜+기기 기준
     if rows_conv:
         df_conv = pd.DataFrame(rows_conv)
