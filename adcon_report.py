@@ -782,29 +782,31 @@ def get_g_data(d_from, d_to, logs=None):
     client = _google_client()
     ga = client.get_service("GoogleAdsService")
 
-    # 쿼리1: 노출/클릭/비용
+    # 쿼리1: 노출/클릭/비용 - 광고그룹 단위
     query_cost = f"""
         SELECT
           segments.date,
           campaign.advertising_channel_type,
           campaign.name,
+          ad_group.name,
           segments.device,
           metrics.impressions,
           metrics.clicks,
           metrics.cost_micros
-        FROM campaign
+        FROM ad_group
         WHERE segments.date BETWEEN '{d_from}' AND '{d_to}'
     """.strip()
 
-    # 쿼리2: 가입 전환만 (비용/노출/클릭 없이)
+    # 쿼리2: 가입 전환만 - 광고그룹 단위
     query_conv = f"""
         SELECT
           segments.date,
           campaign.name,
+          ad_group.name,
           segments.device,
           segments.conversion_action_category,
           metrics.conversions
-        FROM campaign
+        FROM ad_group
         WHERE segments.date BETWEEN '{d_from}' AND '{d_to}'
     """.strip()
 
@@ -829,7 +831,7 @@ def get_g_data(d_from, d_to, logs=None):
                         "매체": "구글",
                         "캠페인유형": type_ko.get(ch, ch),
                         "캠페인": r.campaign.name,
-                        "그룹": "",
+                        "그룹": r.ad_group.name,   # ✅ 광고그룹명
                         "날짜": str(r.segments.date),
                         "기기": d_map.get(r.segments.device.name, "모바일"),
                         "노출수": int(r.metrics.impressions),
@@ -846,18 +848,22 @@ def get_g_data(d_from, d_to, logs=None):
         try:
             stream2 = ga.search_stream(customer_id=cust_id, query=query_conv)
             conv_count = 0
+            cat_names_seen = set()
             for b in stream2:
                 for r in b.results:
-                    if r.segments.conversion_action_category.name != "SIGN_UP":
+                    cat_name = r.segments.conversion_action_category.name
+                    cat_names_seen.add(cat_name)
+                    if cat_name != "SIGN_UP":
                         continue
                     rows_conv.append({
                         "캠페인": r.campaign.name,
+                        "그룹": r.ad_group.name,   # ✅ 광고그룹명
                         "날짜": str(r.segments.date),
                         "기기": d_map.get(r.segments.device.name, "모바일"),
                         "가입": float(r.metrics.conversions),
                     })
                     conv_count += 1
-            logs.append(f"✅ [Google conv] customer_id={cust_id} rows={conv_count}")
+            logs.append(f"✅ [Google conv] customer_id={cust_id} rows={conv_count} 카테고리목록={cat_names_seen}")
         except Exception as e:
             logs.append(f"⚠️ [Google conv] customer_id={cust_id} 오류: {e}")
 
@@ -866,11 +872,11 @@ def get_g_data(d_from, d_to, logs=None):
 
     df_cost = pd.DataFrame(rows_cost)
 
-    # 가입 머지
+    # 가입 머지 - 캠페인+그룹+날짜+기기 기준
     if rows_conv:
         df_conv = pd.DataFrame(rows_conv)
-        df_conv_agg = df_conv.groupby(["캠페인","날짜","기기"], as_index=False)["가입"].sum()
-        df_cost = df_cost.merge(df_conv_agg, on=["캠페인","날짜","기기"], how="left")
+        df_conv_agg = df_conv.groupby(["캠페인","그룹","날짜","기기"], as_index=False)["가입"].sum()
+        df_cost = df_cost.merge(df_conv_agg, on=["캠페인","그룹","날짜","기기"], how="left")
         df_cost["가입"] = df_cost["가입"].fillna(0)
     else:
         df_cost["가입"] = 0.0
