@@ -79,10 +79,6 @@ NAVER_ACCOUNTS = _load_naver_accounts()
 # ✅ 애드콘 BS 설정
 # =========================================================
 BS_CAMP_NAME = "003. 브랜드검색_애드콘"
-BS_GROUP_FEE = {
-    "애드콘_브랜드 MO": Decimal("44000"),  # VAT 포함
-    "애드콘_브랜드 PC": Decimal("22000"),  # VAT 포함
-}
 
 # =========================================================
 # ✅ 공용 유틸
@@ -470,6 +466,7 @@ def get_n_data(d_from, d_to, logs=None):
     rows = []
     since = yyyymmdd(d_from)
     until = yyyymmdd(d_to)
+    days  = _date_list_yyyymmdd(d_from, d_to)
 
     for acc in NAVER_ACCOUNTS:
         service = acc.get("service", "애드콘")
@@ -482,7 +479,7 @@ def get_n_data(d_from, d_to, logs=None):
             continue
 
         # 전체 (캠페인, 그룹) 목록 수집
-        tasks = []  # (camp, grp) 튜플
+        tasks = []
         for camp in camps:
             camp_id = camp.get("nccCampaignId")
             if not camp_id:
@@ -529,15 +526,15 @@ def get_n_data(d_from, d_to, logs=None):
                 if not device:
                     device = infer_device_from_campaign_name(camp_name)
 
-                imp  = int(item.get("impCnt", 0) or 0)
-                clk  = int(item.get("clkCnt", 0) or 0)
-                conv = float(item.get("ccnt", 0) or 0)
+                imp = int(item.get("impCnt", 0) or 0)
+                clk = int(item.get("clkCnt", 0) or 0)
 
                 if imp == 0:
                     continue
 
                 if is_bs:
-                    cost      = BS_GROUP_FEE.get(grp_name, Decimal("0"))
+                    # ✅ 그룹명 상관없이 기기로만 판단
+                    cost      = Decimal("44000") if device == "모바일" else Decimal("22000")
                     media_div = "브랜드검색"
                     camp_type = "브랜드검색/신제품검색"
                 else:
@@ -551,12 +548,13 @@ def get_n_data(d_from, d_to, logs=None):
                     "캠페인유형": camp_type,
                     "캠페인": camp_name,
                     "그룹": grp_name,
+                    "그룹ID": grp_id,
                     "날짜": dt_norm,
                     "기기": device,
                     "노출수": imp,
                     "클릭수": clk,
                     "총비용": float(cost),
-                    "가입": conv,
+                    "가입": 0,   # ✅ 일단 0 → 아래에서 AD_CONVERSION으로 채움
                     "서비스": service,
                 })
             return result
@@ -574,7 +572,54 @@ def get_n_data(d_from, d_to, logs=None):
                 if done % 50 == 0:
                     logs.append(f"[NAVER] 진행: {done}/{len(tasks)}")
 
-        logs.append(f"✅ [NAVER] account={acc.get('customer_id')} 완료 rows={len(rows)}")
+        logs.append(f"✅ [NAVER] account={acc.get('customer_id')} stats 완료 rows={len(rows)}")
+
+        # ✅ AD_CONVERSION 리포트로 회원가입(sign_up)만 머지
+        # 날짜별 1회 호출 (그룹별 개별호출 아님)
+        try:
+            camp_map, grp_map, kw_map = naver_build_name_maps(acc, logs=logs)
+            conv_rows = []
+            for day in days:
+                df_conv = _fetch_naver_report_day(acc, day, "AD_CONVERSION", camp_map, grp_map, kw_map, logs)
+                if df_conv is None or df_conv.empty:
+                    continue
+                # sign_up(회원가입)만 필터
+                df_conv = df_conv[df_conv["convType"] == "sign_up"]
+                if df_conv.empty:
+                    continue
+                # 그룹ID + pcMblTp 기준 집계
+                if "adgroupId" in df_conv.columns and "ccnt" in df_conv.columns:
+                    agg = df_conv.groupby(["adgroupId","pcMblTp"], as_index=False)["ccnt"].sum()
+                    agg["날짜"] = f"{day[:4]}-{day[4:6]}-{day[6:8]}"
+                    conv_rows.append(agg)
+
+            if conv_rows:
+                df_conv_all = pd.concat(conv_rows, ignore_index=True)
+                # pcMblTp → 기기
+                df_conv_all["기기"] = df_conv_all["pcMblTp"].apply(
+                    lambda x: "PC" if str(x).upper().strip() in ("P","PC") else "모바일"
+                )
+
+                # rows에 가입 업데이트
+                for i, row in enumerate(rows):
+                    grp_id = row.get("그룹ID", "")
+                    dt     = row.get("날짜", "")
+                    dev    = row.get("기기", "")
+                    match  = df_conv_all[
+                        (df_conv_all["adgroupId"] == grp_id) &
+                        (df_conv_all["날짜"] == dt) &
+                        (df_conv_all["기기"] == dev)
+                    ]
+                    if not match.empty:
+                        rows[i]["가입"] = int(match["ccnt"].sum())
+
+                logs.append(f"✅ [NAVER] AD_CONVERSION 머지 완료")
+        except Exception as e:
+            logs.append(f"⚠️ [NAVER] AD_CONVERSION 머지 실패: {e}")
+
+    # 그룹ID 컬럼 제거 (RAW_COLS에 없음)
+    for row in rows:
+        row.pop("그룹ID", None)
 
     return pd.DataFrame(rows), logs
 
