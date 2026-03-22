@@ -485,6 +485,7 @@ def get_n_data(d_from, d_to, logs=None):
     for acc in NAVER_ACCOUNTS:
         service = acc.get("service", "애드콘")
         logs.append(f"[NAVER] account={acc.get('customer_id')} service={service}")
+        acc_start_idx = len(rows)  # ✅ 이 계정 rows 시작 인덱스
 
         try:
             camps = naver_list_campaigns(acc, logs=logs)[:MAX_CAMPAIGNS_PER_ACCOUNT]
@@ -589,6 +590,7 @@ def get_n_data(d_from, d_to, logs=None):
                     logs.append(f"[NAVER] 진행: {done}/{len(tasks)}")
 
         logs.append(f"✅ [NAVER] account={acc.get('customer_id')} stats 완료 rows={len(rows)}")
+        acc_end_idx = len(rows)  # ✅ 이 계정 rows 끝 인덱스 저장
 
         # ✅ AD_CONVERSION 리포트로 회원가입(sign_up)만 머지
         try:
@@ -599,11 +601,9 @@ def get_n_data(d_from, d_to, logs=None):
                 if df_conv is None or df_conv.empty:
                     continue
 
-                # ✅ 디버그: convType 값 확인
                 if "convType" in df_conv.columns:
                     logs.append(f"[NAVER] AD_CONVERSION day={day} convType목록={df_conv['convType'].unique().tolist()} 전체행={len(df_conv)}")
 
-                # sign_up(회원가입)만 필터
                 df_conv_su = df_conv[df_conv["convType"] == "sign_up"]
                 logs.append(f"[NAVER] sign_up 필터 후 행수={len(df_conv_su)}")
 
@@ -613,7 +613,6 @@ def get_n_data(d_from, d_to, logs=None):
                 if "adgroupId" in df_conv_su.columns and "ccnt" in df_conv_su.columns:
                     agg = df_conv_su.groupby(["adgroupId","pcMblTp"], as_index=False)["ccnt"].sum()
                     agg["날짜"] = f"{day[:4]}-{day[4:6]}-{day[6:8]}"
-                    logs.append(f"[NAVER] conv agg 샘플:\n{agg.head(5).to_string()}")
                     conv_rows.append(agg)
 
             if conv_rows:
@@ -622,17 +621,12 @@ def get_n_data(d_from, d_to, logs=None):
                     lambda x: "PC" if str(x).upper().strip() in ("P","PC") else "모바일"
                 )
 
-                # ✅ 디버그: rows의 그룹ID 샘플 vs conv의 adgroupId 샘플
-                sample_ids_rows = list(set([r.get("그룹ID","") for r in rows[:10]]))
-                sample_ids_conv = df_conv_all["adgroupId"].unique().tolist()[:5]
-                logs.append(f"[NAVER] rows 그룹ID 샘플: {sample_ids_rows}")
-                logs.append(f"[NAVER] conv adgroupId 샘플: {sample_ids_conv}")
-
+                # ✅ 이 계정 rows만 대상으로 머지 (acc_start_idx ~ acc_end_idx)
                 matched = 0
-                for i, row in enumerate(rows):
-                    grp_id = row.get("그룹ID", "")
-                    dt     = row.get("날짜", "")
-                    dev    = row.get("기기", "")
+                for i in range(acc_start_idx, acc_end_idx):
+                    grp_id = rows[i].get("그룹ID", "")
+                    dt     = rows[i].get("날짜", "")
+                    dev    = rows[i].get("기기", "")
                     match  = df_conv_all[
                         (df_conv_all["adgroupId"] == grp_id) &
                         (df_conv_all["날짜"] == dt) &
