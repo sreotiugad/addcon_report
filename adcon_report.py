@@ -271,7 +271,7 @@ def infer_device_from_campaign_name(cname: str) -> str:
         return "모바일"
     return "전체"
 
-def naver_list_campaigns(acc):
+def naver_list_campaigns(acc, logs=None):
     uri = "/ncc/campaigns"
     r = requests.get(NAVER_BASE_URL + uri, headers=naver_headers(acc, uri, "GET"), timeout=30)
     if r.status_code != 200:
@@ -279,10 +279,22 @@ def naver_list_campaigns(acc):
     j = safe_json(r)
     if not isinstance(j, list):
         return []
-    # ✅ 라이브 상태만 필터
-    return [c for c in j if str(c.get("status", "")).upper() in ("ELIGIBLE", "ELIGIBLE_STATUS")]
 
-def naver_list_adgroups(acc, campaign_id: str = None):
+    # 디버그: 전체 캠페인 상태 로깅
+    if logs is not None:
+        for c in j:
+            logs.append(f"[NAVER] 캠페인={c.get('name')} status={c.get('status')}")
+
+    # ✅ 라이브 상태 필터 (BS 캠페인은 상태 상관없이 포함)
+    result = []
+    for c in j:
+        status = str(c.get("status", "")).upper()
+        name   = str(c.get("name", ""))
+        if status in ("ELIGIBLE", "ELIGIBLE_STATUS") or name == BS_CAMP_NAME:
+            result.append(c)
+    return result
+
+def naver_list_adgroups(acc, campaign_id: str = None, is_bs: bool = False):
     uri = "/ncc/adgroups"
     params = {}
     if campaign_id:
@@ -298,7 +310,9 @@ def naver_list_adgroups(acc, campaign_id: str = None):
     j = safe_json(r)
     if not isinstance(j, list):
         return []
-    # ✅ 라이브 상태만 필터
+    # ✅ BS 캠페인은 상태 상관없이 전체 포함, 일반 캠페인은 라이브만
+    if is_bs:
+        return j
     return [g for g in j if str(g.get("status", "")).upper() in ("ELIGIBLE", "ELIGIBLE_STATUS")]
 
 def naver_fetch_stats_by_id(acc, target_id, since_yyyymmdd, until_yyyymmdd, breakdown=True):
@@ -473,7 +487,7 @@ def get_n_data(d_from, d_to, logs=None):
         logs.append(f"[NAVER] account={acc.get('customer_id')} service={service}")
 
         try:
-            camps = naver_list_campaigns(acc)[:MAX_CAMPAIGNS_PER_ACCOUNT]
+            camps = naver_list_campaigns(acc, logs=logs)[:MAX_CAMPAIGNS_PER_ACCOUNT]
         except Exception as e:
             logs.append(f"❌ [NAVER] 캠페인 조회 실패: {e}")
             continue
@@ -481,13 +495,15 @@ def get_n_data(d_from, d_to, logs=None):
         # 전체 (캠페인, 그룹) 목록 수집
         tasks = []
         for camp in camps:
-            camp_id = camp.get("nccCampaignId")
+            camp_id   = camp.get("nccCampaignId")
+            camp_name = camp.get("name", "")
             if not camp_id:
                 continue
+            _is_bs = (camp_name == BS_CAMP_NAME)
             try:
-                adgroups = naver_list_adgroups(acc, campaign_id=camp_id)
+                adgroups = naver_list_adgroups(acc, campaign_id=camp_id, is_bs=_is_bs)
             except Exception as e:
-                logs.append(f"❌ adgroups 조회 실패 camp={camp.get('name')} err={e}")
+                logs.append(f"❌ adgroups 조회 실패 camp={camp_name} err={e}")
                 continue
             for grp in adgroups:
                 if grp.get("nccAdgroupId"):
